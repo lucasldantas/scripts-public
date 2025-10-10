@@ -1,67 +1,87 @@
 #!/bin/bash
 
-# Este script vincula usuários a equipamentos no GLPI com base em um CSV.
-# Ele assume que as credenciais do MySQL estão configuradas no arquivo ~/.my.cnf
+# Este script garante a existência de um computador no GLPI e o vincula a um usuário.
+# Ele assume que as credenciais do MySQL estão configuradas de forma segura no arquivo ~/.my.cnf
 
 # --- CONFIGURAÇÕES ---
-# O MySQL lerá as credenciais do [client] block em ~/.my.cnf
-# Certifique-se de que o usuário no .my.cnf tem permissões para SELECT e UPDATE.
-
-DB_NAME="glpidb"             # Nome do seu banco de dados GLPI (confirme se é glpidb ou glpi)
-CSV_FILE="/home/lucasdantas/teste.csv" # Caminho do seu arquivo CSV
-TIPO_EQUIPAMENTO="glpi_computers" # A tabela a ser atualizada (Mude para glpi_monitors, etc., se necessário)
+DB_NAME="glpidb"             # Nome do seu banco de dados GLPI (AJUSTE SE NECESSÁRIO)
+CSV_FILE="/tmp/devices_simples.csv" # Caminho do seu CSV: USERNAME,SERIAL (AJUSTE SE NECESSÁRIO)
+TIPO_EQUIPAMENTO="glpi_computers"
 # ---------------------
 
-echo "Iniciando a vinculação de $TIPO_EQUIPAMENTO no banco de dados $DB_NAME..."
+echo "Iniciando processo de CRIAÇÃO e VINCULAÇÃO em $TIPO_EQUIPAMENTO..."
 
-# Verifica se o arquivo CSV existe
 if [ ! -f "$CSV_FILE" ]; then
-    echo "Erro: Arquivo CSV não encontrado em $CSV_FILE"
+    echo "Erro: Arquivo CSV de entrada não encontrado em $CSV_FILE"
     exit 1
 fi
 
 # Loop para ler cada linha do CSV
-# O 'grep -v USERNAME' ignora uma linha de cabeçalho, se existir.
 cat "$CSV_FILE" | grep -v USERNAME | while IFS=',' read -r USERNAME SERIAL; do
     
-    # Limpa espaços em branco e caracteres invisíveis de nova linha (\r)
+    # Limpa espaços em branco e caracteres invisíveis
     USERNAME=$(echo "$USERNAME" | tr -d '\r' | xargs)
     SERIAL=$(echo "$SERIAL" | tr -d '\r' | xargs)
 
     if [ -z "$USERNAME" ] || [ -z "$SERIAL" ]; then
         continue # Pula linhas vazias
     fi
-
+    
     # 1. Obter o ID do Usuário (users_id)
-    # Usa o nome de login ('name') para buscar o ID.
     USER_ID=$(mysql "$DB_NAME" -Nse "SELECT id FROM glpi_users WHERE name = '$USERNAME' LIMIT 1;")
 
     if [ -z "$USER_ID" ]; then
-        echo "Aviso: Usuário de login '$USERNAME' não encontrado. Pulando o serial $SERIAL..."
+        echo "Aviso: Usuário de login '$USERNAME' não encontrado no GLPI. Pulando o serial $SERIAL..."
         continue
     fi
-
-    # 2. Obter o ID do Equipamento (item_id)
+    
+    # 2. Verificar se o Serial existe e obter o ITEM_ID
     ITEM_ID=$(mysql "$DB_NAME" -Nse "SELECT id FROM $TIPO_EQUIPAMENTO WHERE serial = '$SERIAL' LIMIT 1;")
-
+    
+    
     if [ -z "$ITEM_ID" ]; then
-        echo "Aviso: Serial '$SERIAL' não encontrado na tabela $TIPO_EQUIPAMENTO. Pulando..."
-        continue
+        # --- AÇÃO: CRIAR NOVO DEVICE ---
+        INVENTORY_NAME="ARCO-$SERIAL"
+        
+        INSERT_SQL="
+            INSERT INTO $TIPO_EQUIPAMENTO 
+            (name, serial, manufacturers_id, computermodels_id, date_creation, is_deleted, is_template) 
+            VALUES (
+                '$INVENTORY_NAME', 
+                '$SERIAL', 
+                0, 
+                0, 
+                NOW(), 
+                0,
+                0
+            );
+        "
+        
+        mysql "$DB_NAME" -e "$INSERT_SQL"
+        
+        if [ $? -eq 0 ]; then
+            echo "SUCESSO: Criado o Serial $SERIAL (ARCO-...). Tentando vincular..."
+            # Obtém o ID do item recém-criado para a próxima etapa
+            ITEM_ID=$(mysql "$DB_NAME" -Nse "SELECT id FROM $TIPO_EQUIPAMENTO WHERE serial = '$SERIAL' LIMIT 1;")
+        else
+            echo "ERRO CRÍTICO: Falha ao criar o Serial $SERIAL. Pulando a vinculação."
+            continue
+        fi
+    else
+        echo "INFO: Serial $SERIAL já existe (ID $ITEM_ID). Apenas vinculando..."
     fi
 
-    # 3. Executar o UPDATE para vincular: Seta o users_id no item
+    # 3. VINCULAR O DEVICE AO USUÁRIO
     UPDATE_SQL="UPDATE $TIPO_EQUIPAMENTO SET users_id = $USER_ID WHERE id = $ITEM_ID;"
     
-    # Executa a atualização no banco de dados
     mysql "$DB_NAME" -e "$UPDATE_SQL"
     
     if [ $? -eq 0 ]; then
-        echo "SUCESSO: Serial $SERIAL vinculado ao Usuário $USERNAME (ID $USER_ID)."
+        echo "SUCESSO: Serial $SERIAL (ID $ITEM_ID) vinculado ao Usuário $USERNAME."
     else
-        # Se ocorrer um erro (geralmente problema de permissão ou conexão)
-        echo "ERRO: Falha ao vincular o Serial $SERIAL. Verifique as permissões do DB."
+        echo "ERRO: Falha ao vincular o Serial $SERIAL ao usuário $USERNAME."
     fi
 
 done
 
-echo "Processo de vinculação concluído."
+echo "Processo de CRIAÇÃO e VINCULAÇÃO concluído."
